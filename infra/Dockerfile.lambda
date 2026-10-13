@@ -1,0 +1,7 @@
+# One image, four Lambda functions; template.yaml picks the handler with ImageConfig.Command.
+# pandas + pyarrow + duckdb + numpy are ~320 MB installed, over the 250 MB limit for zip packages.
+FROM public.ecr.aws/lambda/python:3.12-arm64
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+COPY barsha ${LAMBDA_TASK_ROOT}/barsha
+CMD ["barsha.aws.handlers.ingest_handler"]

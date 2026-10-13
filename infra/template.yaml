@@ -1,0 +1,602 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Barsha - Nepal monsoon rainfall lakehouse. S3 + Lambda + Step Functions + Glue Data Catalog
+  + Athena. Serverless and scales to zero. Deploy: infra/README.md. Cost: docs/COST.md.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for public extreme-rain reports (confirm the email AWS sends).
+  OpsEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for operator alerts, alarms and the budget warning.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasOpsEmail: !Not [!Equals [!Ref OpsEmail, ""]]
+
+Globals:
+  Function:
+    # Graviton: about 20% cheaper per GB-second than x86 for the same work.
+    Architectures: [arm64]
+    Tracing: Active
+    Environment:
+      Variables:
+        LAKE_BUCKET: !Ref LakeBucket
+        SOURCE_BUCKET: noaa-gsod-pds
+        ALERT_TOPIC: !Ref AlertTopic
+        OPS_TOPIC: !Ref OpsTopic
+
+Resources:
+  # ---------------- storage ----------------
+  LakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Versioning makes raw/ an audit log: every upstream revision of a station-year file is
+      # kept as a noncurrent version, and a bad overwrite of silver/ can be rolled back.
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          # The current-year file changes daily, so raw/ gains ~15 noncurrent versions a day.
+          - Id: expire-old-raw-versions
+            Status: Enabled
+            Prefix: raw/
+            NoncurrentVersionExpiration: {NoncurrentDays: 90}
+          - Id: expire-old-derived-versions
+            Status: Enabled
+            Prefix: silver/
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+          - Id: expire-old-gold-versions
+            Status: Enabled
+            Prefix: gold/
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration: {NoncurrentDays: 1}
+          - Id: expire-quarantine
+            Status: Enabled
+            Prefix: quarantine/
+            ExpirationInDays: 180
+          # No Glacier/IA transitions: the whole lake is ~50 MB and most objects are under the
+          # 128 KB minimum billable size for IA, so a transition would cost more than it saves.
+
+  # ---------------- catalog and query ----------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: barsha
+        Description: Nepal daily weather (silver) and rainfall marts (gold).
+
+  # Partition projection: Athena computes partition locations from the year, so there is no
+  # crawler to run and no MSCK REPAIR after each load.
+  DailyWeatherTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: daily_weather
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.year.type: integer
+          projection.year.range: "1976,2100"
+          storage.location.template: !Sub "s3://${LakeBucket}/silver/daily_weather/year=${!year}/"
+        PartitionKeys:
+          - {Name: year, Type: int}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/silver/daily_weather/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: station_id, Type: string}
+            - {Name: obs_date, Type: date}
+            - {Name: station_name, Type: string}
+            - {Name: latitude, Type: double}
+            - {Name: longitude, Type: double}
+            - {Name: elevation_m, Type: double}
+            - {Name: tavg_c, Type: double}
+            - {Name: tmax_c, Type: double}
+            - {Name: tmin_c, Type: double}
+            - {Name: prcp_reported_mm, Type: double, Comment: "As reported, converted from inches. Not always a full day."}
+            - {Name: prcp_mm, Type: double, Comment: "Null unless prcp_quality = complete."}
+            - {Name: prcp_flag, Type: string}
+            - {Name: prcp_quality, Type: string, Comment: "complete | partial | missing"}
+            - {Name: rain_observed, Type: boolean}
+            - {Name: thunder_observed, Type: boolean}
+            - {Name: source_file, Type: string}
+
+  RainDailyTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: rain_daily
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/rain_daily/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: station_id, Type: string}
+            - {Name: obs_date, Type: date}
+            - {Name: year, Type: bigint}
+            - {Name: prcp_mm, Type: double}
+            - {Name: prcp_reported_mm, Type: double}
+            - {Name: prcp_flag, Type: string}
+            - {Name: prcp_quality, Type: string}
+            - {Name: rain_observed, Type: boolean}
+            - {Name: rain_3day_mm, Type: double}
+            - {Name: rain_category, Type: string}
+            - {Name: p99_wet_mm, Type: double}
+            - {Name: p999_wet_mm, Type: double}
+            - {Name: prior_max_mm, Type: double}
+            - {Name: prior_wet_days, Type: bigint}
+            - {Name: neighbour_max_mm, Type: double}
+            - {Name: is_suspect, Type: boolean}
+            - {Name: is_station_record, Type: boolean}
+            - {Name: alert_level, Type: string}
+
+  MonsoonSeasonTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: monsoon_season
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/monsoon_season/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: station_id, Type: string}
+            - {Name: year, Type: bigint}
+            - {Name: complete_days, Type: bigint}
+            - {Name: partial_days, Type: bigint}
+            - {Name: missing_days, Type: bigint}
+            - {Name: absent_days, Type: bigint}
+            - {Name: missing_on_rain_days, Type: bigint}
+            - {Name: completeness, Type: double}
+            - {Name: jjas_total_mm, Type: double}
+            - {Name: total_status, Type: string}
+            - {Name: max_1day_mm, Type: double}
+            - {Name: max_3day_mm, Type: double}
+            - {Name: heavy_days, Type: bigint}
+            - {Name: alert_days, Type: bigint}
+
+  StationHealthTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: station_health
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/station_health/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: station_id, Type: string}
+            - {Name: station_name, Type: string}
+            - {Name: first_obs, Type: date}
+            - {Name: last_obs, Type: date}
+            - {Name: days_since_last_obs, Type: bigint}
+            - {Name: completeness_last_365, Type: double}
+            - {Name: share_rain_days_missing_amount, Type: double}
+            - {Name: status, Type: string}
+            - {Name: as_of, Type: date}
+
+  StationDimTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: station_dim
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/station_dim/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: station_id, Type: string}
+            - {Name: version, Type: int}
+            - {Name: station_name, Type: string}
+            - {Name: latitude, Type: double}
+            - {Name: longitude, Type: double}
+            - {Name: elevation_m, Type: double}
+            - {Name: valid_from, Type: date}
+            - {Name: valid_to, Type: date}
+            - {Name: is_current, Type: boolean}
+
+  QualitySummaryTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: quality_summary
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet}
+        StorageDescriptor:
+          Location: !Sub "s3://${LakeBucket}/gold/quality_summary/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: station_id, Type: string}
+            - {Name: prcp_quality, Type: string}
+            - {Name: prcp_flag, Type: string}
+            - {Name: days, Type: bigint}
+            - {Name: days_rain_observed, Type: bigint}
+            - {Name: reported_zero, Type: bigint}
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: barsha
+      Description: Analyst queries over the Barsha lake.
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        # Athena bills $5 per TB scanned. The whole lake is ~50 MB, so a query that scans
+        # more than 1 GB is a mistake (a cross join, a runaway CTAS); stop it.
+        BytesScannedCutoffPerQuery: 1073741824
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${LakeBucket}/athena-results/"
+          EncryptionConfiguration: {EncryptionOption: SSE_S3}
+
+  # ---------------- messaging ----------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: barsha-rain-reports
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties: {TopicArn: !Ref AlertTopic, Protocol: email, Endpoint: !Ref AlertEmail}
+
+  OpsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: barsha-ops
+
+  OpsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasOpsEmail
+    Properties: {TopicArn: !Ref OpsTopic, Protocol: email, Endpoint: !Ref OpsEmail}
+
+  # ---------------- compute ----------------
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Metadata: {DockerContext: .., Dockerfile: infra/Dockerfile.lambda, DockerTag: v1}
+    Properties:
+      PackageType: Image
+      ImageConfig: {Command: ["barsha.aws.handlers.ingest_handler"]}
+      MemorySize: 512
+      # A daily run copies ~15 small files. A backfill copies ~410 and needs longer.
+      Timeout: 600
+      # NOAA's bucket is read with unsigned (anonymous) requests, which never use this role,
+      # so the role only needs the lake.
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref LakeBucket}
+
+  TransformFunction:
+    Type: AWS::Serverless::Function
+    Metadata: {DockerContext: .., Dockerfile: infra/Dockerfile.lambda, DockerTag: v1}
+    Properties:
+      PackageType: Image
+      ImageConfig: {Command: ["barsha.aws.handlers.transform_handler"]}
+      MemorySize: 1024
+      Timeout: 600
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref LakeBucket}
+
+  GoldFunction:
+    Type: AWS::Serverless::Function
+    Metadata: {DockerContext: .., Dockerfile: infra/Dockerfile.lambda, DockerTag: v1}
+    Properties:
+      PackageType: Image
+      ImageConfig: {Command: ["barsha.aws.handlers.gold_handler"]}
+      # DuckDB uses all vCPUs it is given; Lambda allocates CPU in proportion to memory.
+      MemorySize: 2048
+      Timeout: 300
+      Environment:
+        Variables:
+          HOME: /tmp  # DuckDB writes its config and extension cache under $HOME
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref LakeBucket}
+
+  BulletinFunction:
+    Type: AWS::Serverless::Function
+    Metadata: {DockerContext: .., Dockerfile: infra/Dockerfile.lambda, DockerTag: v1}
+    Properties:
+      PackageType: Image
+      ImageConfig: {Command: ["barsha.aws.handlers.bulletin_handler"]}
+      MemorySize: 512
+      Timeout: 60
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref LakeBucket}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt AlertTopic.TopicName}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt OpsTopic.TopicName}
+
+  # ---------------- orchestration ----------------
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: barsha-daily
+      Type: STANDARD
+      Tracing: {Enabled: true}
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup: {LogGroupArn: !GetAtt PipelineLogs.Arn}
+      Policies:
+        - LambdaInvokePolicy: {FunctionName: !Ref IngestFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref TransformFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref GoldFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref BulletinFunction}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt OpsTopic.TopicName}
+        - CloudWatchLogsFullAccess
+      DefinitionSubstitutions:
+        IngestArn: !GetAtt IngestFunction.Arn
+        TransformArn: !GetAtt TransformFunction.Arn
+        GoldArn: !GetAtt GoldFunction.Arn
+        BulletinArn: !GetAtt BulletinFunction.Arn
+        OpsTopicArn: !Ref OpsTopic
+      Definition:
+        Comment: Barsha daily load. Each step is idempotent, so any step can be retried or re-run.
+        StartAt: Ingest
+        States:
+          Ingest:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters: {FunctionName: "${IngestArn}", "Payload.$": "$"}
+            OutputPath: $.Payload
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException, States.Timeout]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 3
+                JitterStrategy: FULL
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: AnythingChanged
+          AnythingChanged:
+            Type: Choice
+            Choices:
+              - Variable: $.ingest.changed_years[0]
+                IsPresent: true
+                Next: Transform
+            # Nothing new upstream: still rebuild gold, because station health depends on today.
+            Default: Gold
+          Transform:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters: {FunctionName: "${TransformArn}", "Payload.$": "$"}
+            OutputPath: $.Payload
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException, States.Timeout]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 3
+                JitterStrategy: FULL
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: Gold
+          Gold:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters: {FunctionName: "${GoldArn}", "Payload.$": "$"}
+            OutputPath: $.Payload
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException, States.Timeout]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 3
+                JitterStrategy: FULL
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: Bulletin
+          Bulletin:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters: {FunctionName: "${BulletinArn}", "Payload.$": "$"}
+            OutputPath: $.Payload
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException, States.Timeout]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 3
+                JitterStrategy: FULL
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            End: true
+          NotifyFailure:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: "${OpsTopicArn}"
+              Subject: Barsha daily load failed
+              "Message.$": "States.Format('Run failed: {}', States.JsonToString($.error))"
+            Next: Failed
+          Failed:
+            Type: Fail
+      Events:
+        Daily:
+          Type: ScheduleV2
+          Properties:
+            # 01:30 UTC = 07:15 Nepal time. GSOD usually has the previous day by then.
+            ScheduleExpression: cron(30 1 * * ? *)
+            Input: '{"mode": "daily"}'
+            RetryPolicy: {MaximumRetryAttempts: 2, MaximumEventAgeInSeconds: 3600}
+            DeadLetterConfig: {Arn: !GetAtt SchedulerDLQ.Arn}
+
+  SchedulerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  # Log retention: CloudWatch keeps logs forever by default, which is a slow cost leak.
+  PipelineLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /aws/vendedlogs/states/barsha-daily, RetentionInDays: 30}
+  IngestLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${IngestFunction}", RetentionInDays: 14}
+  TransformLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${TransformFunction}", RetentionInDays: 14}
+  GoldLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${GoldFunction}", RetentionInDays: 14}
+  BulletinLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${BulletinFunction}", RetentionInDays: 14}
+
+  # ---------------- alarms ----------------
+  PipelineFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The daily load failed after retries.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{Name: StateMachineArn, Value: !Ref PipelineStateMachine}]
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  PipelineNotRunningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The daily load has not started in two days (schedule disabled or broken).
+      Namespace: AWS/States
+      MetricName: ExecutionsStarted
+      Dimensions: [{Name: StateMachineArn, Value: !Ref PipelineStateMachine}]
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref OpsTopic]
+
+  SourceStaleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: No Nepal station has a new day upstream for more than 3 days. The feed, not the weather, has stopped.
+      Namespace: Barsha
+      MetricName: SourceLagDays
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref OpsTopic]
+
+  QuarantineAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A year failed the quality gate; silver kept its last good version. See quarantine/.
+      Namespace: Barsha
+      MetricName: YearsQuarantined
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  DLQNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A scheduled run was dropped after all retries.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt SchedulerDLQ.QueueName}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref OpsTopic]
+
+  # ---------------- cost guardrail ----------------
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasOpsEmail
+    Properties:
+      Budget:
+        BudgetName: barsha-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyBudgetUsd, Unit: USD}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref OpsEmail}]
+        - Notification: {NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref OpsEmail}]
+
+Outputs:
+  LakeBucketName:
+    Value: !Ref LakeBucket
+  StateMachineArn:
+    Value: !Ref PipelineStateMachine
+  AthenaWorkGroup:
+    Value: !Ref AthenaWorkGroup
+  AlertTopicArn:
+    Value: !Ref AlertTopic

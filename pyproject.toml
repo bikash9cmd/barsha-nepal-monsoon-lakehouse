@@ -1,0 +1,33 @@
+[project]
+name = "barsha"
+version = "0.1.0"
+description = "Nepal monsoon rainfall lakehouse on AWS: NOAA GSOD -> S3 -> Athena, with quality gates and extreme-rain reports"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "Bikash Kushwaha"}]
+dependencies = [
+    "boto3>=1.35",
+    "duckdb>=1.2",
+    "pandas>=2.2",
+    "pyarrow>=17",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "moto[s3,sns]>=5", "ruff>=0.6", "cfn-lint>=1.0", "matplotlib>=3.8"]
+
+[tool.setuptools.packages.find]
+include = ["barsha*"]
+
+[tool.setuptools.package-data]
+"barsha.sql" = ["*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
