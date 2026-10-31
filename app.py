@@ -12,13 +12,14 @@ from pathlib import Path
 import duckdb
 import streamlit as st
 
+import brand
 from barsha import pipeline
 from barsha.alerts import render
 from barsha.gold import TABLES, gold_key
 from barsha.source import open_source
 from barsha.storage import open_lake
 
-st.set_page_config(page_title="Barsha", page_icon="🌧️", layout="wide")
+brand.page("barsha")
 
 LAKE = "lake"
 PRESETS = {
@@ -64,16 +65,13 @@ def sql(q: str):
     return db().cursor().sql(q).df()
 
 
-st.title("Barsha (वर्षा)")
-st.caption("50 years of Nepal's weather-station rainfall in a lakehouse: how unusual was yesterday's rain, and where?")
-
 lk = lake()
 bulletin, stations, query = st.tabs(["Daily bulletin", "A station's monsoons", "SQL"])
 
 with bulletin:
     day = st.date_input("Replay the bulletin for", value=date(2024, 9, 28), min_value=date(1977, 1, 1))
     st.caption("28 September 2024 is the Kathmandu flood. Bulletins are in English and Nepali.")
-    st.code(render(pipeline.replay_bulletin(lk, day)), language=None)
+    st.code(render(pipeline.replay_bulletin(lk, day)), language=None, wrap_lines=True)
 
 with stations:
     names = sql("select station_id, station_name from station_dim where is_current order by station_name")
@@ -92,8 +90,10 @@ with stations:
 with query:
     preset = st.selectbox("Start from", list(PRESETS))
     text = st.text_area("SQL (DuckDB) over daily_weather, " + ", ".join(TABLES), PRESETS[preset], height=150)
-    if st.button("Run"):
+    if st.button("Run query", type="primary"):
         try:
             st.dataframe(sql(text), hide_index=True, width="stretch")
         except duckdb.Error as e:
             st.error(str(e))
+
+brand.footer()
