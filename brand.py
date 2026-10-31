@@ -18,7 +18,7 @@ import streamlit as st
 
 OWNER = "Bikash Kushwaha"
 ROLE = "Machine learning and cloud engineer, Nepal"
-HUB = "https://bikash-kushwaha.onrender.com"
+HUB = "https://bikash9cmd-portfolio.onrender.com"
 GITHUB = "https://github.com/bikash9cmd"
 LINKEDIN = "https://www.linkedin.com/in/bikash9cmd"
 
