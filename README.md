@@ -1,5 +1,7 @@
 # Barsha (वर्षा): a monsoon rainfall lakehouse for Nepal on AWS
 
+[![Try it live](https://img.shields.io/badge/Try_it-live-2ea44f?style=for-the-badge)](https://barsha-nepal-monsoon-lakehouse.onrender.com)
+
 Barsha turns 50 years of public weather-station data for Nepal into a clean, queryable rainfall record. Every morning it tells disaster responders, reporters and insurers how unusual yesterday's rain was for each place. The data comes from NOAA's daily summaries on the AWS Open Data registry and lands in an S3 lakehouse (raw, silver, gold). A quality gate decides what gets published, Athena serves SQL, and a daily bulletin goes out in English and Nepali. It runs serverless for about **$1.20 a month**.
 
 ```text
@@ -90,6 +92,16 @@ The full log, with causes and fixes, is in [docs/CHALLENGES_AND_BUGS.md](docs/CH
 2. **The feed had stopped and every run said OK.** "Nothing new arrived" and "nothing to do" are now different states, with an alarm that also fires when the metric goes missing.
 3. **The second source was a copy of the first.** GHCN-Daily agreed with GSOD on all 6,086 Kathmandu days because it is built from GSOD. I checked lineage and dropped it instead of calling it validation.
 4. **"1 in 100 rainy days" is not a "100-year" event.** My first Nepali text said the latter, which overstates the rarity a hundredfold.
+
+## Try it live
+
+**[https://barsha-nepal-monsoon-lakehouse.onrender.com](https://barsha-nepal-monsoon-lakehouse.onrender.com)**
+
+Replay the daily bulletin for any day since 1977 (28 September 2024 is the Kathmandu flood), browse a station's monsoon totals year by year, and run SQL over the lake.
+
+It runs on a free server that sleeps when nobody is using it, so the first visit can take a minute to wake up. Everything runs offline: no API keys, no cloud account.
+
+To run the same page locally: `pip install -r requirements-app.txt` and then `streamlit run app.py`.
 
 ## Run it
 

@@ -1,0 +1,12 @@
+# Render Blueprint for the live demo (free web service). Render > New > Blueprint, pick this repo.
+services:
+  - type: web
+    name: barsha-nepal-monsoon-lakehouse
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-app.txt && python -m barsha --lake lake run --backfill
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8

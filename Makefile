@@ -1,7 +1,7 @@
 PY ?= python
 LAKE ?= lake
 
-.PHONY: setup backfill daily rebuild replay charts test lint validate-infra cost
+.PHONY: setup backfill daily rebuild replay charts test lint validate-infra cost app
 
 setup:            ## virtualenv with dev dependencies
 	$(PY) -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
@@ -32,3 +32,6 @@ lint:
 
 validate-infra:   ## lint the SAM/CloudFormation template
 	cfn-lint infra/template.yaml
+
+app:              ## the Streamlit demo on http://localhost:8501 (pip install -r requirements-app.txt first)
+	$(PY) -m streamlit run app.py
