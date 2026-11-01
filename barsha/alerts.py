@@ -106,16 +106,27 @@ def build_bulletin(rain_daily: pd.DataFrame, health: pd.DataFrame, as_of: date, 
                    f"3x its 99.9th percentile with no heavy rain within 200 km. Held back for review."),
         })
 
-    reporting = health[health["status"] != "retired"]
-    newest = pd.to_datetime(reporting["last_obs"]).max() if len(reporting) else None
+    # The feed's age comes from every station, retired or not: when the whole feed stops,
+    # all stations retire together after RETIRED_AFTER_DAYS and the lag must not vanish.
+    newest = pd.to_datetime(health["last_obs"]).max() if len(health) else None
+    if newest is not None and pd.isna(newest):
+        newest = None
     source_lag = (pd.Timestamp(as_of) - newest).days if newest is not None else None
-    if source_lag is None or source_lag > STALE_AFTER_DAYS:
+    reporting = health[health["status"] != "retired"]
+    if source_lag is None:
         alerts.append({
             "type": "SOURCE_STALE",
             "level": "page",
             "audience": "operator",
-            "en": (f"No station has reported for {source_lag} days (newest day "
-                   f"{newest.date() if newest is not None else 'none'}). "
+            "en": (f"There is no station data in the lake up to {as_of.isoformat()}. "
+                   "Run a backfill or check the ingest step; reports are paused, not quiet."),
+        })
+    elif source_lag > STALE_AFTER_DAYS:
+        alerts.append({
+            "type": "SOURCE_STALE",
+            "level": "page",
+            "audience": "operator",
+            "en": (f"No station has reported for {source_lag} days (newest day {newest.date()}). "
                    "The upstream feed has stopped; reports are paused, not quiet."),
         })
     else:
@@ -134,7 +145,9 @@ def build_bulletin(rain_daily: pd.DataFrame, health: pd.DataFrame, as_of: date, 
 
 
 def render(bulletin: dict) -> str:
-    lines = [f"Barsha bulletin for {bulletin['as_of']} (source lag: {bulletin['source_lag_days']} days)"]
+    lag = bulletin["source_lag_days"]
+    lag_text = "no data" if lag is None else f"{lag} days"
+    lines = [f"Barsha bulletin for {bulletin['as_of']} (source lag: {lag_text})"]
     if not bulletin["alerts"]:
         lines.append("No extreme rain and no reporting problems.")
     for a in bulletin["alerts"]:
