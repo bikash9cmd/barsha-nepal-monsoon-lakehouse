@@ -3,7 +3,7 @@ from datetime import date, timedelta
 import pandas as pd
 import pytest
 
-from barsha.alerts import build_bulletin, ne_digits
+from barsha.alerts import build_bulletin, ne_digits, render
 from barsha.gold import build_gold_frames
 from barsha.ingest import ingest
 from barsha.source import LocalSource
@@ -124,6 +124,30 @@ def test_bulletin_flags_extreme_rain_and_stale_feed(mirror, lake_dir, history):
     b = build_bulletin(frames["rain_daily"], frames["station_health"], later)
     assert [a["type"] for a in b["alerts"]] == ["SOURCE_STALE"]
     assert b["source_lag_days"] == 60
+
+
+def test_stale_feed_keeps_its_lag_after_every_station_retires(mirror, lake_dir):
+    """A feed that stopped long ago retires every station at once; the page must still say how long."""
+    mirror.put(2020, KTM, year_rows(KTM, 2020))
+    mirror.put(2020, OKH, year_rows(OKH, 2020))
+    years_later = date(2024, 6, 1)
+    frames = build_gold_frames(_load(mirror, lake_dir, [2020]), years_later)
+    assert set(frames["station_health"]["status"]) == {"retired"}
+
+    b = build_bulletin(frames["rain_daily"], frames["station_health"], years_later)
+    assert b["source_lag_days"] == (years_later - date(2020, 12, 31)).days
+    assert [a["type"] for a in b["alerts"]] == ["SOURCE_STALE"]
+    assert f"for {b['source_lag_days']} days (newest day 2020-12-31)" in b["alerts"][0]["en"]
+    assert "None" not in render(b)
+
+
+def test_empty_lake_says_there_is_no_data(lake_dir):
+    frames = build_gold_frames(load_silver(LocalLake(lake_dir)), date(2024, 9, 28))
+    b = build_bulletin(frames["rain_daily"], frames["station_health"], date(2024, 9, 28))
+    assert b["source_lag_days"] is None
+    assert [a["type"] for a in b["alerts"]] == ["SOURCE_STALE"]
+    assert "no station data" in b["alerts"][0]["en"]
+    assert "None" not in render(b) and "source lag: no data" in render(b)
 
 
 def test_one_station_silent_while_others_report(mirror, lake_dir):

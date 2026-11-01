@@ -113,7 +113,7 @@ make backfill        # every year since 1976 into ./lake (~1 minute)
 make replay          # the bulletin for 28 September 2024
 make daily           # what the scheduler runs: incremental, usually copies nothing
 python -m barsha query "select * from monsoon_season where station_id = '44454099999' order by year desc limit 10"
-make test            # 31 tests, no network needed
+make test            # 33 tests, no network needed
 ```
 
 Deploying to AWS: [infra/README.md](infra/README.md). Example Athena queries: [sql/athena/](sql/athena/).
@@ -135,7 +135,7 @@ barsha/
 infra/             SAM template (S3, Lambda, Step Functions, Glue, Athena, SNS, alarms, budget)
 sql/athena/        analyst queries
 scripts/           cost model, charts
-tests/             31 tests, including the Lambdas against mocked S3 and SNS
+tests/             33 tests, including the Lambdas against mocked S3 and SNS
 docs/              data, architecture, alternatives, failure modes, cost, bugs
 ```
 
