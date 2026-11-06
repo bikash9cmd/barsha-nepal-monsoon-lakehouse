@@ -1,4 +1,4 @@
-# Barsha (वर्षा): a monsoon rainfall lakehouse for Nepal on AWS
+# Nepal Monsoon Rainfall Lakehouse: a monsoon rainfall lakehouse for Nepal on AWS
 
 [![Try it live](https://img.shields.io/badge/Try_it-live-2ea44f?style=for-the-badge)](https://barsha-nepal-monsoon-lakehouse.onrender.com)
 
